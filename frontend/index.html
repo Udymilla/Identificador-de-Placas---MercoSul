@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>ANPR Gate Demo (OCR)</title>
+  <link rel="stylesheet" href="/static/css/styles.css"/>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>ANPR / LPR • Gate Demo</h1>
+      <p>Simulação + Upload com OCR (padrão Mercosul)</p>
+    </header>
+
+    <main class="grid">
+      <section class="video">
+        <!-- <img src="demo.gif" alt="demo" /> -->
+        <div class="overlay" id="statusOverlay">Pronto</div>
+        <div class="controls">
+          <button id="startBtn">Iniciar simulação</button>
+          <button id="stopBtn">Parar</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="card">
+          <h2>Verificação manual</h2>
+          <div class="row">
+            <input id="plateInput" placeholder="Digite a placa (ex.: ABC1D23)" />
+            <button id="checkBtn">Checar</button>
+          </div>
+          <div id="checkResult" class="result"></div>
+        </div>
+
+        <div class="card">
+          <h2>Upload de imagem (OCR)</h2>
+          <div class="row">
+            <input type="file" id="fileInput" accept="image/*" />
+            <button id="uploadBtn">Enviar</button>
+          </div>
+          <div id="ocrResult" class="result"></div>
+          <img id="ocrPreview" style="max-width:100%; border:1px solid #2b3350; border-radius:10px; display:none; margin-top:6px;" />
+        </div>
+
+        <div class="card">
+          <h2>Configurar placas</h2>
+          <div class="row">
+            <input id="newPlate" placeholder="Nova placa (Mercosul: ABC1D23)" />
+            <button id="addBtn">Adicionar</button>
+          </div>
+          <ul id="plateList"></ul>
+        </div>
+
+        <div class="card">
+          <h2>Log de eventos</h2>
+          <div id="events"></div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <small>Template educacional. Integre YOLO + OCR real em produção.</small>
+    </footer>
+  </div>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
