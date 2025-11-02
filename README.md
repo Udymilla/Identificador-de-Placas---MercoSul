@@ -1,10 +1,19 @@
-# ANPR/LPR Gate Demo — OCR + Upload (FastAPI + Dashboard)
+# 🚗 ANPR / LPR - Gate Demo
 
-Rodando local:
+Projeto educacional de Reconhecimento Automático de Placas (ANPR / LPR)
+usando **Python (FastAPI)** + **OCR (EasyOCR)** + **Frontend HTML/JS**.
+
+## 🧩 Tecnologias
+- FastAPI
+- EasyOCR
+- OpenCV
+- HTML/CSS/JS
+
+## 🚀 Como rodar
+
+### Backend
 ```bash
 cd backend
-pip install -r requirements.txt
-pip install easyocr opencv-python pillow numpy
 uvicorn app:app --reload --port 8000
-```
-Abra: http://localhost:8000
+cd frontend
+python -m http.server 8080
