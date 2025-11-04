@@ -2,9 +2,10 @@
 # ANPR / LPR - Gate Demo (Reconhecimento e Controle de Placas)
 # ============================================
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from backend.ocr_predictor import recognize_plate
 import easyocr
 import numpy as np
 import traceback
@@ -14,6 +15,37 @@ from PIL import Image
 import re
 import os
 import sqlite3
+
+# --- PASTAS E ARQUIVOS AUXILIARES ---
+os.makedirs("detected", exist_ok=True)
+CASCADE_PATH = os.path.join("backend", "models", "haarcascade_russian_plate_number.xml")
+
+# --- EASYOCR: carregar só uma vez (evita lentidão a cada requisição) ---
+reader = easyocr.Reader(['en', 'pt'], gpu=False)
+
+# --- Normalização simples para padrão Mercosul (ABC1D23) ---
+MERCOSUL_RE = re.compile(r'^[A-Z]{3}\d[A-Z0-9]\d{2}$')
+
+def normalize_plate(txt: str) -> str:
+    if not txt:
+        return ""
+    t = "".join(ch for ch in txt.upper() if ch.isalnum())
+    if len(t) < 7:
+        return t
+    # Correções comuns do OCR nas posições numéricas
+    # ABC 1 D 23
+    # 012 3 4 56
+    chars = list(t[:7])
+    want = ["A","A","A","N","A","N","N"]  # A=letra, N=número
+    swapL = {"0":"O","1":"I","5":"S","8":"B","2":"Z","6":"G"}
+    swapN = {"O":"0","I":"1","L":"1","S":"5","B":"8","Z":"2","G":"6"}
+    for i,ch in enumerate(chars):
+        if want[i] == "A" and not ch.isalpha():
+            chars[i] = swapL.get(ch, ch)
+        if want[i] == "N" and not ch.isdigit():
+            chars[i] = swapN.get(ch, ch)
+    fixed = "".join(chars)
+    return fixed
 
 # ============================================
 # CONFIGURAÇÕES INICIAIS
@@ -74,22 +106,25 @@ def check_plate_exists(plate: str) -> bool:
     return exists
 
 
-# ============================================
-# ENDPOINT: UPLOAD DE IMAGEM + OCR
-# ============================================
 @app.post("/api/upload")
 async def upload_image(file: UploadFile = File(...)):
     try:
+        import io, cv2, numpy as np, re, traceback
+        from PIL import Image
+        from backend.ocr_predictor import recognize_plate  # OCR híbrido
+
+        # --- Leitura do arquivo recebido ---
         img_bytes = await file.read()
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         img_np = np.array(img)
 
+        # --- Converter para tons de cinza e aplicar pré-processamento ---
         gray = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.Canny(blurred, 100, 200)
 
+        # --- Detectar área da placa (contornos) ---
         contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-
         plate_region = None
         for c in contours:
             x, y, w, h = cv2.boundingRect(c)
@@ -108,66 +143,87 @@ async def upload_image(file: UploadFile = File(...)):
             plate_region = img_np
             print(">>> Nenhuma região típica de placa encontrada — usando imagem completa.")
 
+        # --- Converter para escala de cinza e melhorar contraste ---
         gray_plate = cv2.cvtColor(plate_region, cv2.COLOR_BGR2GRAY)
         gray_plate = cv2.equalizeHist(gray_plate)
-        gray_plate = cv2.convertScaleAbs(gray_plate, alpha=1.7, beta=15)
+        gray_plate = cv2.convertScaleAbs(gray_plate, alpha=2.2, beta=20)
+        gray_plate = cv2.GaussianBlur(gray_plate, (3, 3), 0)
 
-        kernel = np.ones((3, 3), np.uint8)
-        morph = cv2.morphologyEx(gray_plate, cv2.MORPH_CLOSE, kernel)
+        # --- Realçar bordas ---
+        edges = cv2.Canny(gray_plate, 50, 150)
+        edges = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
+        combined = cv2.addWeighted(gray_plate, 0.8, edges, 0.5, 0)
 
+        # --- Limiar adaptativo para binarização ---
         thresh = cv2.adaptiveThreshold(
-            morph, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV, 41, 15
+            combined, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 31, 9
         )
 
         cv2.imwrite("detected/placa_preprocessada.jpg", thresh)
 
-        reader = easyocr.Reader(['en', 'pt'], gpu=False)
-        result = reader.readtext(thresh)
+        # ======================================================
+        # 🔹 OCR híbrido (EasyOCR + KNN)
+        # ======================================================
+        final_plate = recognize_plate(thresh)
 
-        print(">>> Resultado bruto OCR:", result)
+        # --- Correções e normalização ---
+        def normalize_plate(txt):
+            t = "".join(ch for ch in txt.upper() if ch.isalnum())
+            if len(t) >= 7:
+                corrections = str.maketrans({
+                    "O": "0", "Q": "0",
+                    "I": "1", "L": "1",
+                    "S": "5", "B": "8", "Z": "2"
+                })
+                t = t.translate(corrections)
+            return t
 
-        texts = [r[1].strip().upper() for r in result]
-        print(">>> Textos detectados:", texts)
-
-        plate_pattern = re.compile(r'^[A-Z]{3}\d[A-Z0-9]\d{2}$')
-        possible_plates = [t for t in texts if plate_pattern.match(t)]
-        final_plate = possible_plates[0] if possible_plates else "N/A"
-
-        if final_plate == "N/A":
-            result2 = reader.readtext(plate_region)
-            texts2 = [r[1].strip().upper() for r in result2]
-            possible_plates2 = [t for t in texts2 if plate_pattern.match(t)]
-            if possible_plates2:
-                final_plate = possible_plates2[0]
-            print(">>> Segunda tentativa OCR:", texts2)
-
+        final_plate = normalize_plate(final_plate)
         print(">>> Texto final interpretado:", final_plate)
+
+        # ======================================================
+        # 🔹 Verifica se está cadastrada (autorizada)
+        # ======================================================
+        found = check_plate_exists(final_plate)
+        status = "AUTORIZADO" if found else "NEGADO"
+        if final_plate == "N/A":
+            status = "NEGADO"
+
+        print(f">>> Resultado final: {final_plate} → {status}")
 
         return JSONResponse({
             "status": "ok",
-            "ocr_result": final_plate
+            "ocr_result": final_plate,
+            "authorization": status
         })
 
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Erro ao processar imagem: {e}")
-
-
 # ============================================
 # ENDPOINT: ADICIONAR PLACA MANUALMENTE
 # ============================================
+from fastapi import Body
+
 @app.post("/api/plates")
-async def add_plate(plate: str):
-    plate = plate.strip().upper()
-    if not re.match(r'^[A-Z]{3}\d[A-Z0-9]\d{2}$', plate):
-        raise HTTPException(status_code=400, detail="Formato de placa inválido.")
+async def add_plate(plate: str = None, payload: dict = Body(None)):
+    # aceita ?plate=ABC1D23 ou body {"plate":"ABC1D23"}
+    if plate is None and payload and "plate" in payload:
+        plate = payload["plate"]
+
+    if not plate:
+        raise HTTPException(status_code=400, detail="Informe a placa.")
+
+    plate = normalize_plate(plate)
+    if not MERCOSUL_RE.match(plate):
+        raise HTTPException(status_code=400, detail="Formato de placa inválido (padrão Mercosul: ABC1D23).")
+
     success = save_plate(plate)
     if not success:
-        return {"status": "duplicado", "message": "Placa já cadastrada."}
-    return {"status": "ok", "message": f"Placa {plate} adicionada com sucesso."}
-
-
+        return {"status": "duplicado", "message": "Placa já cadastrada.", "plate": plate}
+    return {"status": "ok", "message": f"Placa {plate} adicionada com sucesso.", "plate": plate}
 # ============================================
 # ENDPOINT: CHECAR PLACA
 # ============================================
@@ -175,9 +231,14 @@ async def add_plate(plate: str):
 async def check_plate(plate: str):
     plate = plate.strip().upper()
     found = check_plate_exists(plate)
-    return {"status": "ok", "found": found}
-
-
+    result = "AUTORIZADO" if found else "NEGADO"
+    print(f">>> Verificação manual: {plate} → {result}")
+    return {
+        "status": "ok",
+        "plate": plate,
+        "found": found,
+        "result": result
+    }
 # ============================================
 # ENDPOINT: STATUS DA API
 # ============================================
@@ -185,7 +246,26 @@ async def check_plate(plate: str):
 async def test_api():
     return {"status": "API Online"}
 
+@app.get("/api/plates/list")
+async def list_plates():
+    # lista simples do banco
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT plate FROM plates ORDER BY plate")
+    plates = [row[0] for row in cur.fetchall()]
+    conn.close()
+    return {"status": "ok", "plates": plates}
 
+@app.delete("/api/plates/delete/{plate}")
+async def delete_plate(plate: str):
+    plate = normalize_plate(plate)
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM plates WHERE plate = ?", (plate,))
+    conn.commit()
+    deleted = cur.rowcount
+    conn.close()
+    return {"status": "ok", "deleted": deleted, "plate": plate}
 # ============================================
 # EXECUÇÃO LOCAL
 # ============================================
