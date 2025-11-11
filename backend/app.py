@@ -109,31 +109,24 @@ def check_plate_exists(plate: str) -> bool:
 @app.post("/api/upload")
 async def upload_image(file: UploadFile = File(...)):
     try:
-        import io, cv2, numpy as np, re, traceback
-        from PIL import Image
-        from backend.ocr_predictor import recognize_plate  # OCR híbrido
-
-        # --- Leitura do arquivo recebido ---
+        # ========= CARREGAR E PRÉ-PROCESSAR =========
         img_bytes = await file.read()
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         img_np = np.array(img)
 
-        # --- Converter para tons de cinza e aplicar pré-processamento ---
         gray = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.Canny(blurred, 100, 200)
 
-        # --- Detectar área da placa (contornos) ---
         contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         plate_region = None
+
         for c in contours:
             x, y, w, h = cv2.boundingRect(c)
             aspect_ratio = w / float(h)
             if 2 < aspect_ratio < 6 and 80 < w < 1000 and 25 < h < 300:
-                y1 = max(0, y - 15)
-                y2 = min(img_np.shape[0], y + h + 15)
-                x1 = max(0, x - 25)
-                x2 = min(img_np.shape[1], x + w + 25)
+                y1, y2 = max(0, y - 15), min(img_np.shape[0], y + h + 15)
+                x1, x2 = max(0, x - 25), min(img_np.shape[1], x + w + 25)
                 plate_region = img_np[y1:y2, x1:x2]
                 cv2.imwrite("detected/placa_crop.jpg", plate_region)
                 print(f">>> Região da placa salva em detected/placa_crop.jpg (x={x1}, y={y1}, w={x2-x1}, h={y2-y1})")
@@ -143,49 +136,63 @@ async def upload_image(file: UploadFile = File(...)):
             plate_region = img_np
             print(">>> Nenhuma região típica de placa encontrada — usando imagem completa.")
 
-        # --- Converter para escala de cinza e melhorar contraste ---
+        # ========= PRÉ-PROCESSAMENTO PARA OCR =========
         gray_plate = cv2.cvtColor(plate_region, cv2.COLOR_BGR2GRAY)
         gray_plate = cv2.equalizeHist(gray_plate)
-        gray_plate = cv2.convertScaleAbs(gray_plate, alpha=2.2, beta=20)
-        gray_plate = cv2.GaussianBlur(gray_plate, (3, 3), 0)
+        gray_plate = cv2.convertScaleAbs(gray_plate, alpha=1.7, beta=15)
+        kernel = np.ones((3, 3), np.uint8)
+        morph = cv2.morphologyEx(gray_plate, cv2.MORPH_CLOSE, kernel)
 
-        # --- Realçar bordas ---
-        edges = cv2.Canny(gray_plate, 50, 150)
-        edges = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
-        combined = cv2.addWeighted(gray_plate, 0.8, edges, 0.5, 0)
-
-        # --- Limiar adaptativo para binarização ---
+        # Testa modo invertido se necessário
         thresh = cv2.adaptiveThreshold(
-            combined, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV, 31, 9
+            morph, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 41, 15
         )
+        cv2.imwrite("detected/debug_entrada_ocr.jpg", thresh)
 
-        cv2.imwrite("detected/placa_preprocessada.jpg", thresh)
+        # ========= EASY OCR =========
+        reader = easyocr.Reader(['en', 'pt'], gpu=False)
+        result = reader.readtext(thresh)
+        easy_texts = [r[1].strip().upper() for r in result]
+        print(">>> EasyOCR:", easy_texts)
 
-        # ======================================================
-        # 🔹 OCR híbrido (EasyOCR + KNN)
-        # ======================================================
-        final_plate = recognize_plate(thresh)
+        # ========= FALLBACK PARA KNN =========
+        final_plate = "N/A"
+        if easy_texts:
+            final_plate = easy_texts[0]
+        else:
+            try:
+                from ocr_predictor import ocr_knn_predict
+                knn_result = ocr_knn_predict(plate_region)
+                print(">>> KNN reconheceu:", knn_result)
+                if knn_result:
+                    final_plate = knn_result
+            except Exception as e:
+                print(f"[WARN] Falha ao usar KNN: {e}")
 
-        # --- Correções e normalização ---
-        def normalize_plate(txt):
-            t = "".join(ch for ch in txt.upper() if ch.isalnum())
-            if len(t) >= 7:
-                corrections = str.maketrans({
-                    "O": "0", "Q": "0",
-                    "I": "1", "L": "1",
-                    "S": "5", "B": "8", "Z": "2"
-                })
-                t = t.translate(corrections)
-            return t
+        # ========= CORREÇÃO DE ERROS COMUNS =========
+        substitutions = {
+            'O': '0', 'Q': '0', 'D': '0',
+            'I': '1', 'L': '1',
+            'Z': '2',
+            'S': '5',
+            'B': '8'
+        }
+        corrected = "".join(substitutions.get(ch, ch) for ch in final_plate)
+        if corrected != final_plate:
+            print(f">>> Placa corrigida de {final_plate} para {corrected}")
+            final_plate = corrected
 
-        final_plate = normalize_plate(final_plate)
-        print(">>> Texto final interpretado:", final_plate)
+        # ========= TREINAMENTO CONTÍNUO (APRENDIZADO) =========
+        if final_plate != "N/A":
+            try:
+                from ocr_predictor import update_knn_model
+                update_knn_model(plate_region, final_plate)
+                print(f">>> Modelo KNN atualizado com a placa {final_plate}")
+            except Exception as e:
+                print(f"[WARN] Não foi possível atualizar KNN: {e}")
 
-        # ======================================================
-        # 🔹 Verifica se está cadastrada (autorizada)
-        # ======================================================
+        # ========= CHECAGEM NO BANCO =========
         found = check_plate_exists(final_plate)
         status = "AUTORIZADO" if found else "NEGADO"
         if final_plate == "N/A":
@@ -196,7 +203,7 @@ async def upload_image(file: UploadFile = File(...)):
         return JSONResponse({
             "status": "ok",
             "ocr_result": final_plate,
-            "authorization": status
+            "authorized": status
         })
 
     except Exception as e:
