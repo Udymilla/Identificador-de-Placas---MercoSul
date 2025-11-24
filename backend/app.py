@@ -1,53 +1,85 @@
 # ============================================
-# ANPR / LPR - Gate Demo (Reconhecimento e Controle de Placas)
+# ANPR / LPR - Gate Demo (YOLOv5 + EasyOCR)
 # ============================================
+
+import os
+import io
+import re
+import sqlite3
+import traceback
+
+import cv2
+import numpy as np
+from PIL import Image
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-import os
-import io
-import re
-import cv2
-import sqlite3
-import traceback
-import numpy as np
-from PIL import Image
-
-# --- Tentar carregar YOLO (opcional) ---
-YOLO_AVAILABLE = False
-yolo_model = None
+# ==== MODELOS EXTERNOS ====
+# YOLOv5 via ultralytics
 try:
     from ultralytics import YOLO
-    model_path = os.path.join("backend", "models", "yolo_plate.pt")  # ajuste o nome se o seu .pt for outro
-    if os.path.exists(model_path):
-        yolo_model = YOLO(model_path)
-        YOLO_AVAILABLE = True
-        print(f"[YOLO] Modelo carregado de {model_path}")
-    else:
-        print(f"[YOLO] Modelo não encontrado em {model_path}, usando fallback com OpenCV.")
+    YOLO_AVAILABLE = True
 except Exception as e:
-    print(f"[YOLO] Não foi possível carregar YOLO: {e}")
+    print(f"[WARN] Não foi possível importar ultralytics/YOLO: {e}")
     YOLO_AVAILABLE = False
 
-# --- Tentar carregar EasyOCR (opcional) ---
-EASYOCR_AVAILABLE = False
-reader = None
+# EasyOCR
 try:
     import easyocr
-    reader = easyocr.Reader(["en", "pt"], gpu=False)
     EASYOCR_AVAILABLE = True
-    print("[EasyOCR] Reader carregado.")
 except Exception as e:
-    print(f"[EasyOCR] Não foi possível carregar EasyOCR: {e}")
+    print(f"[WARN] Não foi possível importar easyocr: {e}")
     EASYOCR_AVAILABLE = False
 
-# --------------------------------------------
-# PASTAS E BANCO
-# --------------------------------------------
-os.makedirs("detected", exist_ok=True)
-DB_PATH = "plates.db"
+# ============================================
+# CONFIGURAÇÕES E CAMINHOS
+# ============================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DETECTED_DIR = os.path.join(BASE_DIR, "..", "detected")
+os.makedirs(DETECTED_DIR, exist_ok=True)
+
+DB_PATH = os.path.join(BASE_DIR, "..", "plates.db")
+YOLO_WEIGHTS = os.path.join(BASE_DIR, "models", "plate_yolo.pt")
+
+# Regex padrão Mercosul (ABC1D23)
+MERCOSUL_RE = re.compile(r'^[A-Z]{3}\d[A-Z0-9]\d{2}$')
+
+# ============================================
+# FUNÇÕES DE PLACA / BANCO
+# ============================================
+
+def normalize_plate(txt: str) -> str:
+    """Normaliza texto para padrão de placa Mercosul (ABC1D23) o melhor possível."""
+    if not txt:
+        return ""
+    # remove tudo que não é letra ou número
+    t = "".join(ch for ch in txt.upper() if ch.isalnum())
+    if len(t) < 7:
+        return t
+
+    # queremos 7 chars -> ABC1D23
+    t = t[:7]
+    chars = list(t)
+    # A = letra, N = número (padrão Mercosul)
+    want = ["A", "A", "A", "N", "A", "N", "N"]
+
+    # trocas comuns (letra->número e número->letra)
+    swapL = {"0": "O", "1": "I", "2": "Z", "5": "S", "8": "B", "6": "G"}
+    swapN = {"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1",
+             "Z": "2", "S": "5", "B": "8", "G": "6"}
+
+    for i, ch in enumerate(chars):
+        if want[i] == "A" and not ch.isalpha():
+            chars[i] = swapL.get(ch, ch)
+        if want[i] == "N" and not ch.isdigit():
+            chars[i] = swapN.get(ch, ch)
+
+    fixed = "".join(chars)
+    return fixed
+
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -61,41 +93,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-init_db()
 
-# --------------------------------------------
-# NORMALIZAÇÃO DE PLACA (MERCOSUL)
-# --------------------------------------------
-MERCOSUL_RE = re.compile(r"^[A-Z]{3}\d[A-Z0-9]\d{2}$")
-
-def normalize_plate(txt: str) -> str:
-    """Normaliza texto para formato próximo de ABC1D23."""
-    if not txt:
-        return ""
-    t = "".join(ch for ch in txt.upper() if ch.isalnum())
-    if len(t) < 7:
-        return t
-
-    # queremos A A A 1 A 2 3
-    # posições 0,1,2,4 letras; 3,5,6 números
-    chars = list(t[:7])
-    want = ["A", "A", "A", "N", "A", "N", "N"]  # A=letra, N=número
-
-    swapL = {"0": "O", "1": "I", "5": "S", "8": "B", "2": "Z", "6": "G"}
-    swapN = {"O": "0", "I": "1", "L": "1", "S": "5", "B": "8", "Z": "2", "G": "6"}
-
-    for i, ch in enumerate(chars):
-        if want[i] == "A" and not ch.isalpha():
-            chars[i] = swapL.get(ch, ch)
-        if want[i] == "N" and not ch.isdigit():
-            chars[i] = swapN.get(ch, ch)
-
-    fixed = "".join(chars)
-    return fixed
-
-# --------------------------------------------
-# FUNÇÕES DE BANCO
-# --------------------------------------------
 def save_plate(plate: str) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -108,6 +106,7 @@ def save_plate(plate: str) -> bool:
     finally:
         conn.close()
 
+
 def check_plate_exists(plate: str) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -116,104 +115,41 @@ def check_plate_exists(plate: str) -> bool:
     conn.close()
     return exists
 
-# --------------------------------------------
-# DETECÇÃO DA REGIÃO DA PLACA (YOLO ou fallback OpenCV)
-# --------------------------------------------
-def detect_plate_region(img_np: np.ndarray) -> np.ndarray:
-    """
-    Tenta detectar a placa com YOLO.
-    Se não conseguir ou YOLO não estiver disponível, usa fallback simples com contornos.
-    Retorna um recorte (crop) da placa (ou a imagem inteira se não achar nada).
-    """
-    h, w = img_np.shape[:2]
 
-    # 1) YOLO
-    if YOLO_AVAILABLE and yolo_model is not None:
-        try:
-            # YOLO espera RGB
-            results = yolo_model(img_np[:, :, ::-1], verbose=False)
-            boxes = results[0].boxes
-            if boxes is not None and len(boxes) > 0:
-                # Pega a box com maior confiança
-                best_idx = int(boxes.conf.argmax())
-                xyxy = boxes.xyxy[best_idx].cpu().numpy().astype(int)
-                x1, y1, x2, y2 = xyxy
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(w, x2), min(h, y2)
-                crop = img_np[y1:y2, x1:x2]
-                cv2.imwrite("detected/placa_crop.jpg", crop)
-                print(f">>> [YOLO] Placa detectada em detected/placa_crop.jpg (x={x1}, y={y1}, w={x2-x1}, h={y2-y1})")
-                return crop
-        except Exception as e:
-            print(f"[YOLO] Erro ao detectar placa: {e}")
+# ============================================
+# CARREGAR MODELOS (YOLO + EasyOCR)
+# ============================================
 
-    # 2) Fallback com Canny + contornos
-    gray = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 100, 200)
+yolo_model = None
+if YOLO_AVAILABLE and os.path.exists(YOLO_WEIGHTS):
+    try:
+        yolo_model = YOLO(YOLO_WEIGHTS)
+        print(f"[YOLO] Modelo carregado de {YOLO_WEIGHTS}")
+    except Exception as e:
+        print(f"[WARN] Falha ao carregar YOLO: {e}")
+        yolo_model = None
+else:
+    print("[YOLO] Modelo YOLO não disponível (verifique ultralytics e plate_yolo.pt).")
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    for c in contours:
-        x, y, ww, hh = cv2.boundingRect(c)
-        aspect_ratio = ww / float(hh)
-        if 2 < aspect_ratio < 6 and 80 < ww < 1000 and 25 < hh < 300:
-            y1, y2 = max(0, y - 15), min(h, y + hh + 15)
-            x1, x2 = max(0, x - 25), min(w, x + ww + 25)
-            crop = img_np[y1:y2, x1:x2]
-            cv2.imwrite("detected/placa_crop.jpg", crop)
-            print(f">>> [CANNY] Placa detectada em detected/placa_crop.jpg (x={x1}, y={y1}, w={x2-x1}, h={y2-y1})")
-            return crop
+easy_reader = None
+if EASYOCR_AVAILABLE:
+    try:
+        easy_reader = easyocr.Reader(['en', 'pt'], gpu=False)
+        print("[EasyOCR] Reader carregado.")
+    except Exception as e:
+        print(f"[WARN] Falha ao inicializar EasyOCR: {e}")
+        easy_reader = None
+else:
+    print("[EasyOCR] EasyOCR não disponível.")
 
-    print(">>> Nenhuma região típica de placa encontrada — usando imagem completa.")
-    return img_np
 
-# --------------------------------------------
-# OCR DA PLACA
-# --------------------------------------------
-def ocr_plate(plate_img: np.ndarray) -> str:
-    """
-    Roda OCR (EasyOCR se disponível) + normalização de placa.
-    """
-    if not EASYOCR_AVAILABLE or reader is None:
-        print("[OCR] EasyOCR não disponível.")
-        return "N/A"
+# ============================================
+# INICIALIZA FASTAPI
+# ============================================
 
-    gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
-    gray = cv2.convertScaleAbs(gray, alpha=1.7, beta=15)
-
-    kernel = np.ones((3, 3), np.uint8)
-    morph = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
-
-    thresh = cv2.adaptiveThreshold(
-        morph, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 41, 15
-    )
-    cv2.imwrite("detected/placa_preprocessada.jpg", thresh)
-
-    result = reader.readtext(thresh)
-    texts = [r[1].strip().upper() for r in result]
-    print(">>> Textos detectados OCR:", texts)
-
-    if not texts:
-        return "N/A"
-
-    # pega o maior texto (normalmente a placa)
-    best = max(texts, key=len)
-    best_norm = normalize_plate(best)
-    print(f">>> Texto bruto: {best} | Normalizado: {best_norm}")
-
-    if MERCOSUL_RE.match(best_norm):
-        return best_norm
-    return best_norm or "N/A"
-
-# --------------------------------------------
-# FASTAPI
-# --------------------------------------------
-
+init_db()
 app = FastAPI()
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -222,103 +158,196 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ============================================
-# ENDPOINT: UPLOAD DE IMAGEM (OCR + YOLO)
+# FUNÇÃO DE OCR A PARTIR DE UMA REGIÃO (NUMPY)
 # ============================================
+
+def ocr_from_region(plate_img: np.ndarray) -> str | None:
+    """Executa pré-processamento + EasyOCR em uma região de placa."""
+    if easy_reader is None:
+        return None
+
+    # Salva para debug
+    cv2.imwrite(os.path.join(DETECTED_DIR, "plate_crop.jpg"), plate_img)
+
+    gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    gray = cv2.convertScaleAbs(gray, alpha=1.6, beta=10)
+
+    # filtro morfológico
+    kernel = np.ones((3, 3), np.uint8)
+    morph = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+
+    # limiar adaptativo
+    thresh = cv2.adaptiveThreshold(
+        morph, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        41, 15
+    )
+
+    cv2.imwrite(os.path.join(DETECTED_DIR, "plate_preprocessed.jpg"), thresh)
+
+    # OCR
+    results = easy_reader.readtext(thresh, detail=0)
+    texts = [t.strip().upper() for t in results if t.strip()]
+    print("[OCR] Textos detectados:", texts)
+
+    if not texts:
+        return None
+
+    # tenta achar algo que pareça placa Mercosul
+    candidates = []
+    for t in texts:
+        norm = normalize_plate(t)
+        if MERCOSUL_RE.match(norm):
+            candidates.append(norm)
+
+    if candidates:
+        return candidates[0]
+
+    # se nada bateu exato, tenta a primeira leitura normalizada
+    norm0 = normalize_plate(texts[0])
+    return norm0 if norm0 else None
+
+
+# ============================================
+# ENDPOINT: UPLOAD DE IMAGEM (YOLO + OCR)
+# ============================================
+
 @app.post("/api/upload")
 async def upload_image(file: UploadFile = File(...)):
     try:
+        # lê bytes e converte para OpenCV
         img_bytes = await file.read()
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        img_np = np.array(img)[:, :, ::-1]  # PIL RGB -> OpenCV BGR
+        img_pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        img_np = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
-        # 1) Detectar placa
-        plate_region = detect_plate_region(img_np)
+        # salva imagem original de debug
+        cv2.imwrite(os.path.join(DETECTED_DIR, "entrada_original.jpg"), img_np)
 
-        # 2) OCR
-        plate_text = ocr_plate(plate_region)
+        plate_region = None
 
-        # 3) Checar no banco
+        # ========== 1) DETECÇÃO COM YOLO ==========
+        if yolo_model is not None:
+            try:
+                results = yolo_model(img_np, imgsz=640, verbose=False)
+                boxes = results[0].boxes
+                if boxes is not None and len(boxes) > 0:
+                    # pega box com maior confiança
+                    best = boxes[boxes.conf.argmax()]
+                    x1, y1, x2, y2 = best.xyxy[0].cpu().numpy().astype(int)
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(img_np.shape[1], x2), min(img_np.shape[0], y2)
+                    plate_region = img_np[y1:y2, x1:x2]
+                    print(f"[YOLO] Placa detectada em x={x1}, y={y1}, w={x2-x1}, h={y2-y1}")
+                else:
+                    print("[YOLO] Nenhuma placa detectada.")
+            except Exception as e:
+                print(f"[WARN] Erro ao executar YOLO: {e}")
+
+        # ========== 2) FALLBACK: CANNY/CONTORNOS ==========
+        if plate_region is None:
+            print("[CANNY] Usando fallback de contornos.")
+            gray = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            edges = cv2.Canny(blurred, 100, 200)
+            contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            best_box = None
+            best_area = 0
+            for c in contours:
+                x, y, w, h = cv2.boundingRect(c)
+                aspect = w / float(h)
+                area = w * h
+                if 2.0 < aspect < 6.0 and area > best_area and 60 < w < 1000 and 25 < h < 300:
+                    best_area = area
+                    best_box = (x, y, w, h)
+            if best_box:
+                x, y, w, h = best_box
+                x1 = max(0, x - 15)
+                y1 = max(0, y - 15)
+                x2 = min(img_np.shape[1], x + w + 15)
+                y2 = min(img_np.shape[0], y + h + 15)
+                plate_region = img_np[y1:y2, x1:x2]
+                print(f"[CANNY] Placa candidata: x={x1}, y={y1}, w={x2-x1}, h={y2-y1}")
+            else:
+                print("[CANNY] Nenhuma região de placa encontrada.")
+
+        plate_text = None
         allowed = False
-        if plate_text != "N/A":
-            allowed = check_plate_exists(plate_text)
 
-        status_str = "LIBERADO" if allowed else "NEGADO"
-        print(f">>> Resultado final upload: {plate_text} → {status_str}")
+        if plate_region is not None:
+            # ==== OCR da região ====
+            plate_text = ocr_from_region(plate_region)
+            print(f"[UPLOAD] Texto lido (normalizado): {plate_text}")
 
-        # opcionalmente poderia expor uma URL de imagem se você servir /detected pelo backend
-        image_url = None
+            if plate_text and MERCOSUL_RE.match(plate_text):
+                allowed = check_plate_exists(plate_text)
 
+        # resposta para o frontend
         return JSONResponse({
-            "status": "ok",
-            "plate": plate_text,
-            "allowed": allowed,
-            "image_url": image_url
+            "plate": plate_text if plate_text else None,
+            "allowed": allowed
         })
+
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Erro ao processar imagem: {e}")
 
+
 # ============================================
-# ENDPOINT: ADICIONAR PLACA (JSON {plate})
+# ENDPOINT: CHECAGEM MANUAL (/api/check)
 # ============================================
+
+@app.post("/api/check")
+async def api_check(payload: dict = Body(...)):
+    plate_raw = (payload.get("plate") or "").strip().upper()
+    if not plate_raw:
+        raise HTTPException(status_code=400, detail="Informe a placa.")
+
+    plate = normalize_plate(plate_raw)
+    if not MERCOSUL_RE.match(plate):
+        # ainda assim fazemos a checagem, mas avisamos
+        print(f"[CHECK] Placa em formato estranho: {plate_raw} -> {plate}")
+
+    found = check_plate_exists(plate)
+    print(f"[CHECK] Verificação manual: {plate} -> {'LIBERADO' if found else 'NEGADO'}")
+
+    return {
+        "plate": plate,
+        "allowed": bool(found)
+    }
+
+
+# ============================================
+# ENDPOINT: ADICIONAR PLACA (/api/plates)
+# ============================================
+
 @app.post("/api/plates")
 async def add_plate(payload: dict = Body(...)):
-    plate = payload.get("plate", "")
-    plate = normalize_plate(plate)
-
-    if not plate:
+    plate_raw = (payload.get("plate") or "").strip().upper()
+    if not plate_raw:
         raise HTTPException(status_code=400, detail="Informe a placa.")
+
+    plate = normalize_plate(plate_raw)
     if not MERCOSUL_RE.match(plate):
-        raise HTTPException(status_code=400, detail="Formato de placa inválido (padrão Mercosul: ABC1D23).")
+        raise HTTPException(
+            status_code=400,
+            detail="Formato de placa inválido (use padrão Mercosul, ex: ABC1D23)."
+        )
 
     success = save_plate(plate)
     if not success:
         return {"status": "duplicado", "message": "Placa já cadastrada.", "plate": plate}
+
+    print(f"[PLATE] Cadastrada nova placa: {plate}")
     return {"status": "ok", "message": f"Placa {plate} adicionada com sucesso.", "plate": plate}
 
-# ============================================
-# ENDPOINT: CHECAR PLACA (POST /api/check com JSON {plate})
-# ============================================
-@app.post("/api/check")
-async def check_plate_body(payload: dict = Body(...)):
-    plate = payload.get("plate", "")
-    plate = normalize_plate(plate)
-
-    if not plate:
-        raise HTTPException(status_code=400, detail="Informe a placa.")
-
-    found = check_plate_exists(plate)
-    result = "LIBERADO" if found else "NEGADO"
-    print(f">>> Verificação manual: {plate} → {result}")
-
-    return {
-        "status": "ok",
-        "plate": plate,
-        "allowed": found,
-        "result": result,
-    }
-
-# (opcional) manter também a rota antiga GET /api/check/{plate}
-@app.get("/api/check/{plate}")
-async def check_plate_path(plate: str):
-    plate = normalize_plate(plate)
-    found = check_plate_exists(plate)
-    result = "LIBERADO" if found else "NEGADO"
-    print(f">>> Verificação manual (GET): {plate} → {result}")
-    return {
-        "status": "ok",
-        "plate": plate,
-        "allowed": found,
-        "result": result,
-    }
 
 # ============================================
-# ENDPOINTS EXTRAS
+# ENDPOINTS AUXILIARES (LISTAR / TESTE)
 # ============================================
-@app.get("/api/test")
-async def test_api():
-    return {"status": "API Online"}
 
 @app.get("/api/plates/list")
 async def list_plates():
@@ -329,20 +358,16 @@ async def list_plates():
     conn.close()
     return {"status": "ok", "plates": plates}
 
-@app.delete("/api/plates/delete/{plate}")
-async def delete_plate(plate: str):
-    plate = normalize_plate(plate)
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM plates WHERE plate = ?", (plate,))
-    conn.commit()
-    deleted = cur.rowcount
-    conn.close()
-    return {"status": "ok", "deleted": deleted, "plate": plate}
+
+@app.get("/api/test")
+async def test_api():
+    return {"status": "API Online"}
+
 
 # ============================================
-# EXECUÇÃO LOCAL
+# EXECUÇÃO LOCAL DIRETA (opcional)
 # ============================================
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)
